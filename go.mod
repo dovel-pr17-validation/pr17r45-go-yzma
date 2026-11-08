@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/ardanlabs/jinja v1.1.0
-	github.com/ebitengine/purego v0.10.0
+	github.com/ebitengine/purego v0.11.3
 	github.com/hashicorp/go-getter v1.8.6
 	github.com/jupiterrider/ffi v0.8.0
 	github.com/urfave/cli/v2 v2.27.7
