@@ -1,0 +1,157 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+// backendNames holds the display name for each backend.
+var backendNames = map[string]string{
+	"cpu":         "CPU",
+	"cpu-threads": "CPU, more threads",
+	"cuda":        "CUDA",
+	"metal":       "Metal",
+	"rocm":        "ROCm",
+	"vulkan":      "Vulkan",
+	"webgpu":      "WebGPU",
+	"yzma":        "yzma, in process",
+	"ollama":      "ollama, REST",
+	"dmr":         "Docker Model Runner, REST",
+}
+
+func backendName(backend string) string {
+	if name, ok := backendNames[backend]; ok {
+		return name
+	}
+
+	return backend
+}
+
+// buildTables rebuilds every table block in the file from the sections.
+func (d *document) buildTables() error {
+	for pass := 0; ; pass++ {
+		block, ok := d.nextTable()
+		if !ok {
+			return nil
+		}
+		if pass > len(d.lines) {
+			return fmt.Errorf("%s: the tables do not settle, check the markers", d.path)
+		}
+
+		d.replace(block.first+1, block.last, d.tableRows(block.suite))
+	}
+}
+
+type tableBlock struct {
+	suite string
+	first int
+	last  int
+	rows  []string
+}
+
+// nextTable returns the first table block whose rows are not up to date.
+func (d *document) nextTable() (tableBlock, bool) {
+	var blocks []tableBlock
+	var current *tableBlock
+
+	for i, line := range d.lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, markerTableEnd):
+			if current != nil && markerValue(trimmed, markerTableEnd) == current.suite {
+				current.last = i
+				blocks = append(blocks, *current)
+				current = nil
+			}
+		case strings.HasPrefix(trimmed, markerTable):
+			current = &tableBlock{suite: markerValue(trimmed, markerTable), first: i}
+		case current != nil:
+			current.rows = append(current.rows, line)
+		}
+	}
+
+	for _, block := range blocks {
+		if !d.tableIsCurrent(block) {
+			return block, true
+		}
+	}
+
+	return tableBlock{}, false
+}
+
+func (d *document) tableIsCurrent(block tableBlock) bool {
+	want := d.tableRows(block.suite)
+
+	return strings.Join(block.rows, "\n") == strings.Join(want, "\n")
+}
+
+func (d *document) tableRows(suite string) []string {
+	rows := []string{
+		"| Backend | Arch | Machine | Device | Tokens a second | llama.cpp | Date |",
+		"| --- | --- | --- | --- | --- | --- | --- |",
+	}
+	if isCompare(suite) {
+		rows = []string{
+			"| Engine | Arch | Machine | Model | Prompt tokens | Tokens a second | First token ms | Request ms | Version | Date |",
+			"| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+		}
+	}
+
+	for _, s := range d.sections() {
+		if s.meta.Suite != suite {
+			continue
+		}
+		rows = append(rows, tableRow(s.meta))
+	}
+
+	return rows
+}
+
+func tableRow(m meta) string {
+	label := m.Label
+	if label == "" {
+		label = m.Machine
+	}
+
+	if isCompare(m.Suite) {
+		return fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |",
+			backendName(m.Backend), m.Arch, label, orUnknown(m.Model),
+			formatCount(m.PromptTokens),
+			formatRate(m.TokensPerSecond), formatRate(m.TTFTMs), formatRate(m.TotalMs),
+			orUnknown(m.version()), orUnknown(m.Date))
+	}
+
+	device := m.Device
+	if device == "" {
+		device = "-"
+	}
+
+	return fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s |",
+		backendName(m.Backend), m.Arch, label, device,
+		formatRate(m.TokensPerSecond), orUnknown(m.LlamaCPP), orUnknown(m.Date))
+}
+
+// formatCount formats a token count, which is a whole number.
+func formatCount(value float64) string {
+	if value == 0 {
+		return "unknown"
+	}
+
+	return fmt.Sprintf("%.0f", value)
+}
+
+func formatRate(value float64) string {
+	if value == 0 {
+		return "unknown"
+	}
+
+	return fmt.Sprintf("%.1f", value)
+}
+
+func orUnknown(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+
+	return value
+}

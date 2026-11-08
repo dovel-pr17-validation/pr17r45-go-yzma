@@ -1,0 +1,203 @@
+package compare
+
+import (
+	"bytes"
+	"encoding/json"
+	"image"
+	"image/jpeg"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+const stream = `data: {"choices":[{"delta":{"role":"assistant"}}]}
+
+data: {"choices":[{"delta":{"content":"Yes"}}]}
+
+data: {"choices":[{"delta":{"content":", I am"}}]}
+
+data: {"choices":[],"usage":{"completion_tokens":7}}
+
+data: [DONE]
+`
+
+func TestReadStream(t *testing.T) {
+	// The Windows clock has low resolution, so starting in the past keeps the
+	// times above zero.
+	result, err := readStream(strings.NewReader(stream), time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Text != "Yes, I am" {
+		t.Errorf("text = %q, want %q", result.Text, "Yes, I am")
+	}
+	// The server's count wins over the frame count.
+	if result.Tokens != 7 {
+		t.Errorf("tokens = %d, want 7", result.Tokens)
+	}
+	if result.FirstToken <= 0 || result.FirstToken > result.Total {
+		t.Errorf("first token = %v, total = %v", result.FirstToken, result.Total)
+	}
+}
+
+// A server that sends no usage leaves the frame count.
+func TestReadStreamWithoutUsage(t *testing.T) {
+	raw := `data: {"choices":[{"delta":{"content":"a"}}]}
+
+data: {"choices":[{"delta":{"content":"b"}}]}
+
+data: [DONE]
+`
+	result, err := readStream(strings.NewReader(raw), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Tokens != 2 {
+		t.Errorf("tokens = %d, want 2", result.Tokens)
+	}
+}
+
+func TestReadStreamWithoutAnyToken(t *testing.T) {
+	if _, err := readStream(strings.NewReader("data: [DONE]\n"), time.Now()); err == nil {
+		t.Error("an empty answer must give an error")
+	}
+}
+
+// Each run needs its own image, or a server answers the second run from the
+// first run's cache while yzma does all the work again. A benchmark with
+// -count 5 sends more than 100 requests, and runs 1 and 257 must differ too.
+func TestImageVariantsDiffer(t *testing.T) {
+	images, err := NewImages("../../images/domestic_llama.jpg", image.Point{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var made [][]byte
+	for _, n := range []int{0, 1, 2, 256, 257} {
+		img, err := images.Variant(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		made = append(made, img)
+	}
+
+	for i := range made {
+		for j := i + 1; j < len(made); j++ {
+			if bytes.Equal(made[i], made[j]) {
+				t.Errorf("image %d and image %d are the same", i, j)
+			}
+		}
+	}
+}
+
+// Each engine scales images its own way, so the suite gives them one at a
+// size none of them resizes.
+func TestImageVariantsHaveTheSize(t *testing.T) {
+	images, err := NewImages("../../images/domestic_llama.jpg", image.Pt(1280, 960))
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := images.Variant(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Width != 1280 || cfg.Height != 960 {
+		t.Errorf("size = %dx%d, want 1280x960", cfg.Width, cfg.Height)
+	}
+}
+
+// The image is sent as a data URL of the bytes yzma also reads. It goes before
+// the text, as in the yzma prompt, or the model sees a different prompt.
+func TestMessageContentPutsTheImageInTheMessage(t *testing.T) {
+	images, err := NewImages("../../images/domestic_llama.jpg", image.Point{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := images.Variant(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := messageContent(Request{Prompt: ImagePrompt, Image: img})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts, ok := content.([]contentPart)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %#v, want two parts", content)
+	}
+	if parts[0].ImageURL == nil || !strings.HasPrefix(parts[0].ImageURL.URL, "data:image/jpeg;base64,") {
+		t.Fatalf("the first part is not a JPEG data URL: %#v", parts[0])
+	}
+	if parts[1].Text != ImagePrompt {
+		t.Errorf("text = %q, want %q", parts[1].Text, ImagePrompt)
+	}
+}
+
+func TestMessageContentOfTheTextSuite(t *testing.T) {
+	content, err := messageContent(Request{Prompt: TextPrompt})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if content != TextPrompt {
+		t.Errorf("content = %#v, want %q", content, TextPrompt)
+	}
+}
+
+// The sampler must be greedy on every engine, or the answers differ.
+func TestGenerateAsksForGreedySampling(t *testing.T) {
+	var got chatRequest
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n"))
+	}))
+	defer srv.Close()
+
+	engine := NewServer("test", srv.URL+"/v1", "a-model")
+	if _, err := engine.Generate(Request{Prompt: TextPrompt, MaxTokens: 24, Seed: 1234}); err != nil {
+		t.Fatal(err)
+	}
+
+	switch {
+	case got.Temperature != 0:
+		t.Errorf("temperature = %v, want 0", got.Temperature)
+	case got.TopP != 1:
+		t.Errorf("top_p = %v, want 1", got.TopP)
+	case got.Seed != 1234:
+		t.Errorf("seed = %v, want 1234", got.Seed)
+	case got.MaxTokens != 24:
+		t.Errorf("max_tokens = %v, want 24", got.MaxTokens)
+	case !got.Stream:
+		t.Error("the request must ask for a stream, or there is no time to the first token")
+	case !got.StreamOpts.IncludeUsage:
+		t.Error("the request must ask for the usage, or the count of the tokens is a guess")
+	}
+}
+
+func TestGenerateReportsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "model not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	engine := NewServer("test", srv.URL+"/v1", "a-model")
+	_, err := engine.Generate(Request{Prompt: TextPrompt, MaxTokens: 1})
+	if err == nil || !strings.Contains(err.Error(), "model not found") {
+		t.Errorf("err = %v, want the message of the server", err)
+	}
+}

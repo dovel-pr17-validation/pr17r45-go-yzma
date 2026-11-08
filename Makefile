@@ -1,0 +1,241 @@
+# Get the absolute path of the current Makefile
+MAKEFILE_PATH := $(realpath $(lastword $(MAKEFILE_LIST)))
+MAKEFILE_DIR := $(dir $(MAKEFILE_PATH))
+YZMA_LIB ?= $(MAKEFILE_DIR)lib
+MODELS_DIR ?= $(HOME)/models
+WASM_DIR ?= $(MAKEFILE_DIR)build/wasm
+
+# make download-models to download the models used in tests and examples.
+# make download-models MODELS_DIR=/path/to/models to specify a different directory for the models.
+download-models:
+	mkdir -p $(MODELS_DIR)
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q2_K.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/models-moved/resolve/main/jina-reranker-v1-tiny-en/ggml-model-f16.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/callgg/t5-base-encoder-f32/resolve/main/t5base-encoder-q4_0.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/deadprogram/yzma-tests/resolve/main/Gemma2-Base-F32.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/deadprogram/yzma-tests/resolve/main/Gemma2-Lora-F32-LoRA.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/split/stories15M-q8_0-00001-of-00003.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/split/stories15M-q8_0-00002-of-00003.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/split/stories15M-q8_0-00003-of-00003.gguf
+
+# make download-benchmark-models to download the models that the benchmarks use.
+download-benchmark-models:
+	mkdir -p $(MODELS_DIR)
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q2_K.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
+
+clean-llama.cpp:
+	rm -rf $(YZMA_LIB)/*
+
+# make download-llama.cpp VERSION=b8080 to download a specific version of llama.cpp
+download-llama.cpp:
+	yzma install -lib $(YZMA_LIB) $(if $(VERSION),-v $(VERSION))
+
+build:
+	YZMA_LIB=$(YZMA_LIB) go build -o yzma .
+
+install:
+	go install .
+
+# make test to run the tests. Make sure to run `make download-models` first to download the models used in the tests.
+# make test MODELS_DIR=/path/to/models to specify a different directory for the models if you didn't use the default one when downloading the models.
+test:
+	export YZMA_LIB=$(YZMA_LIB) && \
+	export YZMA_TEST_MODEL=$(MODELS_DIR)/SmolLM-135M.Q2_K.gguf && \
+	export YZMA_TEST_MMMODEL=$(MODELS_DIR)/SmolVLM-256M-Instruct-Q8_0.gguf && \
+	export YZMA_TEST_MMPROJ=$(MODELS_DIR)/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf && \
+	export YZMA_TEST_QUANTIZE_MODEL=$(MODELS_DIR)/ggml-model-f16.gguf && \
+	export YZMA_TEST_ENCODER_MODEL=$(MODELS_DIR)/t5base-encoder-q4_0.gguf && \
+	export YZMA_TEST_LORA_MODEL=$(MODELS_DIR)/Gemma2-Base-F32.gguf && \
+	export YZMA_TEST_LORA_ADAPTER=$(MODELS_DIR)/Gemma2-Lora-F32-LoRA.gguf && \
+	export YZMA_TEST_SPLIT_MODELS="$(MODELS_DIR)/stories15M-q8_0-00001-of-00003.gguf,$(MODELS_DIR)/stories15M-q8_0-00002-of-00003.gguf,$(MODELS_DIR)/stories15M-q8_0-00003-of-00003.gguf" && \
+	go test -count=1 ./...
+
+# make test-manifest to check the download resolver against a real llama.cpp release,
+# which catches upstream asset renames. It talks to the GitHub API, so it is not part
+# of `make test`. Set YZMA_TEST_LLAMA_TAG to check a build other than the newest one.
+test-manifest:
+	go test -count=1 -tags manifest -run TestDefaultResolverMatchesRelease ./pkg/download/
+
+# make wasm-example to build the browser example with TinyGo. Run
+# make download-llama.cpp-wasm first to get the WebAssembly build of llama.cpp.
+wasm-example: wasm-assets
+	tinygo build -target wasm -o $(WASM_DIR)/yzma.wasm ./examples/wasm/chat
+	cp "$(shell tinygo env TINYGOROOT)/targets/wasm_exec.js" $(WASM_DIR)/
+
+# make wasm-vlm-example to build the browser example that takes an image.
+wasm-vlm-example: wasm-assets
+	tinygo build -target wasm -o $(WASM_DIR)/yzma-vlm.wasm ./examples/wasm/vlm
+	cp "$(shell tinygo env TINYGOROOT)/targets/wasm_exec.js" $(WASM_DIR)/
+
+# make wasm-tools-example to build the browser example that calls tools.
+wasm-tools-example: wasm-assets
+	tinygo build -target wasm -o $(WASM_DIR)/yzma-tools.wasm ./examples/wasm/tools
+	cp "$(shell tinygo env TINYGOROOT)/targets/wasm_exec.js" $(WASM_DIR)/
+
+# make wasm-decide-example to build the browser example of exp/decide.
+wasm-decide-example: wasm-assets
+	tinygo build -target wasm -o $(WASM_DIR)/yzma-decide.wasm ./examples/wasm/decide
+	cp "$(shell tinygo env TINYGOROOT)/targets/wasm_exec.js" $(WASM_DIR)/
+
+# make wasm-example-go to build the same examples with the standard toolchain.
+# The binaries are larger, but this helps when TinyGo cannot build a dependency.
+wasm-example-go: wasm-assets
+	GOOS=js GOARCH=wasm go build -o $(WASM_DIR)/yzma.wasm ./examples/wasm/chat
+	GOOS=js GOARCH=wasm go build -o $(WASM_DIR)/yzma-vlm.wasm ./examples/wasm/vlm
+	GOOS=js GOARCH=wasm go build -o $(WASM_DIR)/yzma-tools.wasm ./examples/wasm/tools
+	GOOS=js GOARCH=wasm go build -o $(WASM_DIR)/yzma-decide.wasm ./examples/wasm/decide
+	cp "$(shell go env GOROOT)/lib/wasm/wasm_exec.js" $(WASM_DIR)/
+
+# wasm-assets copies the JavaScript glue and the page into the build directory.
+# The two wasm_exec.js files differ, so each build target copies its own.
+wasm-assets:
+	mkdir -p $(WASM_DIR)
+	cp wasm/yzma-loader.js wasm/worker.js wasm/index.html wasm/vlm.html wasm/tools.html wasm/decide.html $(WASM_DIR)/
+
+# make download-llama.cpp-wasm to get the WebAssembly build of llama.cpp.
+download-llama.cpp-wasm:
+	mkdir -p $(WASM_DIR)
+	yzma install -lib $(WASM_DIR) -os wasm $(if $(VERSION),-v $(VERSION))
+
+# make serve-wasm to serve the example with the headers the multithreaded
+# build needs.
+serve-wasm:
+	go run ./wasm/serve -dir $(WASM_DIR)
+
+# make vet-wasm to check the WebAssembly code. go test does not cover it,
+# because the repo tests build for the host machine.
+vet-wasm:
+	GOOS=js GOARCH=wasm go build -o /dev/null ./examples/wasm/chat
+	GOOS=js GOARCH=wasm go build -o /dev/null ./examples/wasm/vlm
+	GOOS=js GOARCH=wasm go build -o /dev/null ./examples/wasm/tools
+	GOOS=js GOARCH=wasm go build -o /dev/null ./examples/wasm/decide
+	GOOS=js GOARCH=wasm go vet ./pkg/llamawasm ./pkg/message ./pkg/template ./exp/decide \
+		./examples/wasm/chat ./examples/wasm/vlm ./examples/wasm/tools ./examples/wasm/decide
+
+# make test-wasm-unit to run the pkg/llamawasm and exp/decide tests in Node.
+# They cover the code that needs no llama.cpp module, such as token batches.
+test-wasm-unit:
+	PATH="$(PATH):$(shell go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test ./pkg/llamawasm ./exp/decide
+
+# make test-wasm-loader to test which build yzma-loader.js picks. It needs no
+# llama.cpp module or browser, so it can cover a GPU that computes wrong values,
+# which no test with a real module can reach.
+test-wasm-loader:
+	node wasm/node/loader-test.js
+
+# make test-wasm to run the WebAssembly build in Node, without a browser.
+test-wasm:
+	node wasm/node/run.js --dir $(WASM_DIR) --model $(MODELS_DIR)/SmolLM-135M.Q2_K.gguf --tokens 12
+
+# make test-wasm-mt to run the multithreaded build in Node. Node has
+# SharedArrayBuffer without the headers a browser needs.
+test-wasm-mt:
+	node wasm/node/run.js --dir $(WASM_DIR) --model $(MODELS_DIR)/SmolLM-135M.Q2_K.gguf --tokens 12 --mt
+
+# make test-wasm-webgpu to check what happens when there is no WebGPU. Node has
+# none, so this must fall back to a CPU build and still generate text. Use
+# test-wasm-dawn or test-wasm-wgpu to run the WebGPU build itself.
+test-wasm-webgpu:
+	node wasm/node/run.js --dir $(WASM_DIR) --model $(MODELS_DIR)/SmolLM-135M.Q2_K.gguf --tokens 12 --webgpu
+
+# make test-wasm-dawn to run the WebGPU build on a real GPU with Dawn, the
+# WebGPU implementation in Chrome, without a browser. It needs Node 25 or later
+# for JSPI. Set GPU=high-performance or GPU=low-power to select the GPU, and
+# DAWN_FLAGS to pass flags to Dawn.
+NODE ?= node
+NODE_DIR ?= $(MAKEFILE_DIR)build/node
+GPU ?=
+DAWN_FLAGS ?= enable-dawn-features=vulkan_enable_f16_on_nvidia
+
+$(NODE_DIR)/node_modules/webgpu/index.js:
+	npm install --prefix $(NODE_DIR) --no-save webgpu@0.6.1
+
+test-wasm-dawn: $(NODE_DIR)/node_modules/webgpu/index.js
+	YZMA_WEBGPU=$(NODE_DIR)/node_modules/webgpu/index.js YZMA_DAWN=$(DAWN_FLAGS) \
+		$(NODE) wasm/node/dawn.js --dir $(WASM_DIR) --model $(MODELS_DIR)/SmolLM-135M.Q2_K.gguf \
+		--tokens 12 --webgpu --require-gpu $(if $(GPU),--gpu $(GPU))
+
+# make test-wasm-wgpu to run the WebGPU build on a real GPU with wgpu, the
+# WebGPU implementation in Firefox, in Deno. Set GPU as for test-wasm-dawn.
+DENO ?= deno
+
+test-wasm-wgpu:
+	$(DENO) run -A wasm/node/wgpu.cjs --dir $(WASM_DIR) --model $(MODELS_DIR)/SmolLM-135M.Q2_K.gguf \
+		--tokens 12 --webgpu --require-gpu $(if $(GPU),--gpu $(GPU))
+
+# make test-wasm-vlm to answer a question about an image in Node, without a
+# browser. Node has no canvas, so the harness makes the pixels itself.
+#
+# It uses the multithreaded build, because running an image through the
+# projector is slow, about 30 seconds with threads and 80 with one.
+test-wasm-vlm:
+	node wasm/node/vlm.js --dir $(WASM_DIR) \
+		--model $(MODELS_DIR)/SmolVLM-256M-Instruct-Q8_0.gguf \
+		--mmproj $(MODELS_DIR)/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf \
+		--tokens 24 --mt
+
+# make test-wasm-tools to call a tool in Node, without a browser.
+#
+# The default only checks the round trip, because a small model makes no tool
+# call. Add --expect-tool get_weather with a model trained for tool calls,
+# for example Qwen2.5-0.5B-Instruct.
+test-wasm-tools:
+	node wasm/node/tools.js --dir $(WASM_DIR) --model $(MODELS_DIR)/SmolLM-135M.Q2_K.gguf --tokens 32
+
+# make test-wasm-decide to ask a Jev-Style model three questions in Node,
+# without a browser. DecideMany must match Decide in the exact mode.
+test-wasm-decide:
+	node wasm/node/decide.js --dir $(WASM_DIR) --readout jev \
+		--model $(MODELS_DIR)/Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf \
+		--config $(MODELS_DIR)/readout_config.json --expect billing,true --mt
+
+clean-wasm:
+	rm -rf $(WASM_DIR)
+
+# make check-ffi to audit the FFI bindings against the current llama.cpp
+# release headers. The gate runs first. If it fails, ignore the audit results.
+check-ffi:
+	cd cmd/yzma-checker && go test ./... && go run .
+
+roadmap:
+	@echo "Checked items (have wrapper):"
+	@grep -E '^\s*[-*]\s*\[x\]' ROADMAP.md | wc -l
+	@echo "Unchecked items (no wrapper):"
+	@grep -E '^\s*[-*]\s*\[ \]' ROADMAP.md | wc -l
+	@echo "Total checklist items:"
+	@grep -E '^\s*[-*]\s*\[(x| )\]' ROADMAP.md | wc -l
+
+# make download-compare-models to download the models for the comparison
+# benchmarks. The servers use the same files, see benchmarks/README.md.
+download-compare-models:
+	mkdir -p $(MODELS_DIR)
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q4_K_M.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/mmproj-F16.gguf
+	yzma model get -y --show-progress=false -o $(MODELS_DIR) -u https://huggingface.co/ggml-org/bge-small-en-v1.5-Q8_0-GGUF/resolve/main/bge-small-en-v1.5-q8_0.gguf
+
+# make benchmarks to run the benchmarks on this machine and write the results
+# to benchmarks/. Run make download-benchmark-models first. On Windows use
+# benchmarks/run.ps1.
+benchmarks:
+	./benchmarks/run.sh
+
+# make benchmarks-wasm to run the WebAssembly benchmarks in Node. Run
+# make download-llama.cpp-wasm and make wasm-example first.
+benchmarks-wasm:
+	./benchmarks/run.sh --backend wasm
+
+# make benchmarks-compare to compare yzma with ollama and Docker Model
+# Runner. Run make download-compare-models first, and start both servers.
+benchmarks-compare:
+	./benchmarks/compare.sh
+
+# make check-benchmarks to verify that each table matches its sections.
+check-benchmarks:
+	go run ./cmd/yzma-bench check benchmarks/linux.md benchmarks/macos.md \
+		benchmarks/windows.md benchmarks/webassembly.md benchmarks/comparison.md

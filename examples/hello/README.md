@@ -1,0 +1,26 @@
+# hello
+
+The "hello, world" of `yzma`.
+
+## Install yzma
+
+Make sure you have installed `yzma` as described in the [install guide](https://yzma.ai/getting-started/install/).
+
+Once installed, follow the instructions from your installer to set the `YZMA_LIB` environment variable.
+
+## Download model
+
+Download the model to the default location on your machine:
+
+```shell
+yzma model get -u https://huggingface.co/QuantFactory/SmolLM2-135M-GGUF/resolve/main/SmolLM2-135M.Q4_K_M.gguf
+```
+
+## Run
+
+```shell
+$ go run ./examples/hello/
+
+
+"Yes, I'm ready to go."
+```

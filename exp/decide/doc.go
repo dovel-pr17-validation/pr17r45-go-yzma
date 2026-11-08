@@ -1,0 +1,86 @@
+// Package decide runs System One models, which answer a typed question about
+// a state with calibrated probabilities instead of text. Three model families
+// are loaded with a config file, and [Open] loads models that need none.
+//
+// Jev-Style models, loaded with [New], use the macjev-render-v1 layout. Each
+// segment is tokenized on its own, with no BOS or EOS and with special tokens
+// kept as plain text.
+//
+//	State:\n<state>\n\n
+//	Question [<type>]: <question>\nOptions:\n
+//	- <option 1>\n ... - <option K>\n
+//	Judge each option:\n
+//	<option 1> ->\n ... <option K> ->\n
+//
+// One decode reads the logits at each " ->" slot. The score of option k is
+// logit(" yes") minus logit(" no") at slot k, and the probabilities are
+// softmax(scores / T). The token ids and the temperatures T come from the
+// readout_config.json that ships with the model, see [LoadConfig].
+//
+// JevK5 models, loaded with [NewJevK5], take a chat prompt with the state,
+// question and lettered options as JSON. One decode reads the logits of the
+// letters A to P at the last token, and the probabilities are softmax(logits / T).
+// A question with more than 16 options is read in several passes and combined.
+// T comes from jevk5_config.json, see [LoadJevK5Config].
+//
+// Decider models, loaded with [NewDeciderModel], take the state and one
+// question with lettered options.
+//
+//	Context:\n<state>
+//	\n\nQuestion: <question>\nOptions:\n(A) <option 1> ... \n(J) <option 10>
+//	\nAnswer: (
+//
+// One decode reads the logits of the option labels at the last token, and the
+// probabilities are softmax(logits / T). A question with more than 10 options
+// uses A to Z and then two letter labels, up to 255 options. With
+// isolated_levels, each level of a score question is its own yes or no
+// question, and the level probabilities are the yes probabilities normalized.
+// T comes from decider_config.json, see [LoadDeciderConfig].
+//
+// [Open] loads a model whose GGUF holds its decision type, prompt template
+// and temperatures, as converted for the llama-server /v1/systemone API. The
+// prompt is the GGUF's "systemone" template. OpenJev reads the logits of the
+// letters A to Z and a to z at the last token. Lev reads the labels A to Z and
+// then AA to ZZ, reads a choice question in both orders and averages them, and
+// reads a noul question as a rating from 0 to 8.
+//
+// Laya and Julia-1 are encoders with a decision head in the llama.cpp graph.
+// The score of an option is the output at its mask token, in the column of
+// the question type, and each question is decoded on its own. Kev scores an
+// option by the dot product of the outputs of the last token and of the token
+// that ends the option. Both need a llama.cpp build that has these models.
+//
+// Pplx-decider reads the labels A to Z and then AA to ZZ at the last token.
+// Vllm-d3 reads them too, but its attention is not causal, so each prompt is
+// read whole in one ubatch. It takes a nil state and a question with no text.
+// Lfm2-d1 picks the labels of each question as its training code did, and
+// scores an option by the highest logit of the forms of its label. It also
+// takes a nil state. Lfm3-d1 and lfm3-d1-omni read the labels the same way,
+// but their attention is not causal, a score is the median level, and the
+// confidence is the top probability.
+//
+// Nimble reads the labels A to Z and then AA to ZZ, and its prompt lists all
+// the questions of [Decider.DecideMany]. Granite-switch reads them too, with
+// the decision adapter that its prompt turns on. H2O-lightning reads the
+// labels of its GGUF, and in the browser it needs ABI version 12 of the
+// llama.cpp module.
+//
+// Lfm2-d1-omni has the head of Laya on a bidirectional LFM2 trunk. Its prompt
+// cuts the question and each option to a token budget, as its training code
+// did, and it takes a nil state.
+//
+// Clef and vllm-decision2 have a decision head in the llama.cpp graph that
+// reads the question and option spans marked in an extended batch. Clef reads
+// all the questions of [Decider.DecideMany] in one prompt, so an answer
+// depends on the other questions. Vllm-decision2 reads each question on its
+// own, and its confidence is 1 minus the normalized entropy. In the browser
+// both need ABI version 11 of the llama.cpp module.
+//
+// [Decider.DecideMany] asks several questions about one state and decodes
+// the state once. See [ManyMode] for the exact and batched modes.
+//
+// [ParseRequest] and [Decider.Answer] use the JSON of the TypeSafe
+// /v1/systemone API, the same one llama-server serves.
+//
+// This package is experimental and its API can change.
+package decide

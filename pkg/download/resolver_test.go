@@ -1,0 +1,647 @@
+package download
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	getter "github.com/hashicorp/go-getter"
+)
+
+func TestInstallUsesResolver(t *testing.T) {
+	var got []string
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		url := asset.URL
+		got = append(got, url)
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CUDA, Version: "b7974"}
+	resolver := ResolverFunc(func(resolved Target) ([]string, error) {
+		if resolved != target {
+			t.Errorf("resolver got target %+v, want %+v", resolved, target)
+		}
+		return []string{"https://example.com/runtime.zip", "https://example.com/llama.tar.gz"}, nil
+	})
+
+	if err := Install(context.Background(), target, t.TempDir(), nil, resolver); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+	// Order matters: an auxiliary runtime lands before the libraries linking it.
+	wantURLs := []string{"https://example.com/runtime.zip", "https://example.com/llama.tar.gz"}
+	if len(got) != len(wantURLs) {
+		t.Fatalf("downloaded %v, want %v", got, wantURLs)
+	}
+	for i := range wantURLs {
+		if got[i] != wantURLs[i] {
+			t.Fatalf("downloaded %v, want %v", got, wantURLs)
+		}
+	}
+}
+
+func TestInstallResolverError(t *testing.T) {
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		t.Fatal("Install() downloaded despite a resolver error")
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	sentinel := errors.New("no build for this target")
+	resolver := ResolverFunc(func(Target) ([]string, error) { return nil, sentinel })
+
+	err := Install(context.Background(), Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "b7974"},
+		t.TempDir(), nil, resolver)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Install() error = %v, want %v", err, sentinel)
+	}
+}
+
+func TestInstallNilResolverUsesDefault(t *testing.T) {
+	var got []string
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		url := asset.URL
+		got = append(got, url)
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "b7974"}
+	if err := Install(context.Background(), target, t.TempDir(), nil, nil); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+	want := "https://github.com/ggml-org/llama.cpp/releases/download/b7974/llama-b7974-bin-ubuntu-x64.tar.gz"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("downloaded %v, want [%s]", got, want)
+	}
+}
+
+func TestInstallInvalidVersion(t *testing.T) {
+	err := Install(context.Background(), Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "nogood"},
+		t.TempDir(), nil, nil)
+	if err != ErrInvalidVersion {
+		t.Fatalf("Install() error = %v, want %v", err, ErrInvalidVersion)
+	}
+}
+
+// The Windows CUDA build needs the CUDA runtime archive alongside it.
+func TestDefaultResolverWindowsCUDA(t *testing.T) {
+	urls, err := DefaultResolver.Resolve(Target{Arch: AMD64, OS: Windows, Processor: CUDA, Version: "b7974"})
+	if err != nil {
+		t.Fatalf("Resolve() failed: %v", err)
+	}
+	if len(urls) != 2 {
+		t.Fatalf("Resolve() returned %d urls, want 2: %v", len(urls), urls)
+	}
+	if !strings.Contains(urls[0], "cudart-llama-bin-win-cuda") {
+		t.Errorf("first asset = %q, want the CUDA runtime archive", urls[0])
+	}
+	if !strings.Contains(urls[1], "llama-b7974-bin-win-cuda") {
+		t.Errorf("second asset = %q, want the llama.cpp build", urls[1])
+	}
+}
+
+// A wasm target gets every build from the llama-cpp-builder release page,
+// because the JavaScript glue chooses at run time: WebGPU where the browser has
+// it, multiple threads where the page is isolated, one thread otherwise.
+func TestDefaultResolverWasm(t *testing.T) {
+	for _, prcssr := range []Processor{CPU, WebGPU} {
+		urls, err := DefaultResolver.Resolve(Target{Arch: AMD64, OS: Wasm, Processor: prcssr, Version: "b7974"})
+		if err != nil {
+			t.Fatalf("Resolve(%s) failed: %v", prcssr, err)
+		}
+		if len(urls) != 3 {
+			t.Fatalf("Resolve(%s) returned %d urls, want 3: %v", prcssr, len(urls), urls)
+		}
+		for _, want := range []string{
+			"llama-cpp-builder/releases/download/b7974/llama-b7974-bin-wasm-simd-mt.tar.gz",
+			"llama-cpp-builder/releases/download/b7974/llama-b7974-bin-wasm-webgpu.tar.gz",
+			"llama-cpp-builder/releases/download/b7974/llama-b7974-bin-wasm-simd.tar.gz",
+		} {
+			found := false
+			for _, url := range urls {
+				if strings.HasSuffix(url, want) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("Resolve(%s) = %v, want an asset ending in %q", prcssr, urls, want)
+			}
+		}
+	}
+}
+
+// CUDA, Metal, OpenVINO, ROCm and Vulkan have no meaning in a browser.
+func TestDefaultResolverWasmUnknownProcessor(t *testing.T) {
+	for _, prcssr := range []Processor{CUDA, Metal, OpenVINO, ROCm, Vulkan} {
+		if _, err := DefaultResolver.Resolve(Target{Arch: AMD64, OS: Wasm, Processor: prcssr, Version: "b7974"}); err == nil {
+			t.Errorf("Resolve() accepted a wasm target with the %s processor", prcssr)
+		}
+	}
+}
+
+func TestDefaultResolverLibraryNameWasm(t *testing.T) {
+	if got := LibraryName(Wasm.String()); got != "yzma_wasm.wasm" {
+		t.Errorf("LibraryName(wasm) = %q, want %q", got, "yzma_wasm.wasm")
+	}
+}
+
+func TestDefaultResolverUnknownProcessor(t *testing.T) {
+	_, err := DefaultResolver.Resolve(Target{Arch: ARM64, OS: Windows, Processor: CUDA, Version: "b7974"})
+	if err == nil {
+		t.Fatal("Resolve() accepted a target with no published build")
+	}
+}
+
+// A tagged release has no binaries of its own, so the llama.cpp assets come from the
+// nightly build tag while the llama-cpp-builder assets keep the release tag.
+func TestDefaultResolverTaggedRelease(t *testing.T) {
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "v0.3.0", UpstreamVersion: "b10621"}
+	urls, err := DefaultResolver.Resolve(target)
+	if err != nil {
+		t.Fatalf("Resolve() failed: %v", err)
+	}
+	want := "https://github.com/ggml-org/llama.cpp/releases/download/b10621/llama-b10621-bin-ubuntu-x64.tar.gz"
+	if urls[0] != want {
+		t.Errorf("Resolve() = %q, want %q", urls[0], want)
+	}
+
+	target.Arch = ARM64
+	urls, err = DefaultResolver.Resolve(target)
+	if err != nil {
+		t.Fatalf("Resolve() failed: %v", err)
+	}
+	want = "https://github.com/hybridgroup/llama-cpp-builder/releases/download/v0.3.0/llama-v0.3.0-bin-ubuntu-cpu-arm64.tar.gz"
+	if urls[0] != want {
+		t.Errorf("Resolve() = %q, want %q", urls[0], want)
+	}
+}
+
+// A nightly tag must not go to the llama.cpp release page, which sometimes rate limits.
+func TestInstallNightlyTagSkipsNightlyTagLookup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request for %s", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	originalURL := nightlyTagURL
+	nightlyTagURL = server.URL + "/%s/nightly-tag.txt"
+	defer func() { nightlyTagURL = originalURL }()
+
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "b7974"}
+	if err := Install(context.Background(), target, t.TempDir(), nil, nil); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+}
+
+// A pinned version must not ask the version server which build is the newest.
+func TestInstallUsesDefaultVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request for %s", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	originalCurrent := currentVersionURL
+	currentVersionURL = server.URL + "/llama-cpp-builder/version.json"
+	defer func() { currentVersionURL = originalCurrent }()
+
+	originalDefault := DefaultVersion
+	DefaultVersion = "b7974"
+	defer func() { DefaultVersion = originalDefault }()
+
+	var got []string
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		url := asset.URL
+		got = append(got, url)
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU}
+	if err := Install(context.Background(), target, t.TempDir(), nil, nil); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+
+	want := "https://github.com/ggml-org/llama.cpp/releases/download/b7974/llama-b7974-bin-ubuntu-x64.tar.gz"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("downloaded %v, want [%s]", got, want)
+	}
+}
+
+// An explicit version wins over the pinned one.
+func TestInstallExplicitVersionOverridesDefault(t *testing.T) {
+	originalDefault := DefaultVersion
+	DefaultVersion = "v0.3.0"
+	defer func() { DefaultVersion = originalDefault }()
+
+	var got []string
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		url := asset.URL
+		got = append(got, url)
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "b7974"}
+	if err := Install(context.Background(), target, t.TempDir(), nil, nil); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+
+	want := "https://github.com/ggml-org/llama.cpp/releases/download/b7974/llama-b7974-bin-ubuntu-x64.tar.gz"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("downloaded %v, want [%s]", got, want)
+	}
+}
+
+// "latest" asks for the newest build even when a version is pinned.
+func TestInstallLatestSkipsDefaultVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"tag_name": "b8000"}`))
+	}))
+	defer server.Close()
+
+	originalCurrent := currentVersionURL
+	currentVersionURL = server.URL + "/llama-cpp-builder/version.json"
+	defer func() { currentVersionURL = originalCurrent }()
+
+	originalDefault := DefaultVersion
+	DefaultVersion = "b7974"
+	defer func() { DefaultVersion = originalDefault }()
+
+	var got []string
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		url := asset.URL
+		got = append(got, url)
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU, Version: "latest"}
+	if err := Install(context.Background(), target, t.TempDir(), nil, nil); err != nil {
+		t.Fatalf("Install() failed: %v", err)
+	}
+
+	want := "https://github.com/ggml-org/llama.cpp/releases/download/b8000/llama-b8000-bin-ubuntu-x64.tar.gz"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("downloaded %v, want [%s]", got, want)
+	}
+}
+
+// A pinned version is already published, so a missing file is a real error and must
+// not fall back to the previous build.
+func TestInstallDefaultVersionDoesNotFallBack(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request for %s", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	originalCurrent := currentVersionURL
+	originalPrev := previousVersionURL
+	currentVersionURL = server.URL + "/llama-cpp-builder/version.json"
+	previousVersionURL = server.URL + "/llama-cpp-builder/previous.json"
+	defer func() {
+		currentVersionURL = originalCurrent
+		previousVersionURL = originalPrev
+	}()
+
+	originalDefault := DefaultVersion
+	DefaultVersion = "b7974"
+	defer func() { DefaultVersion = originalDefault }()
+
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		return ErrFileNotFound
+	}
+	defer func() { getFunc = originalGet }()
+
+	target := Target{Arch: AMD64, OS: Linux, Processor: CPU}
+	err := Install(context.Background(), target, t.TempDir(), nil, nil)
+	if !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("Install() error = %v, want %v", err, ErrFileNotFound)
+	}
+}
+
+// llama.cpp renamed its ROCm assets at builds b10356 and b10767. Resolution must
+// follow the names that the requested build published.
+func TestDefaultResolverROCmNaming(t *testing.T) {
+	tests := []struct {
+		name    string
+		os      OS
+		version string
+		want    string
+	}{
+		{"linux before the rename", Linux, "b10355", "llama-b10355-bin-ubuntu-rocm-7.2-x64.tar.gz"},
+		{"linux at the rename", Linux, "b10356", "llama-b10356-bin-ubuntu-rocm-7.14-x64.tar.gz"},
+		{"linux after the rename", Linux, "b10705", "llama-b10705-bin-ubuntu-rocm-7.14-x64.tar.gz"},
+		{"linux before the ROCm 10 rename", Linux, "b10766", "llama-b10766-bin-ubuntu-rocm-7.14-x64.tar.gz"},
+		{"linux at the ROCm 10 rename", Linux, "b10767", "llama-b10767-bin-ubuntu-rocm-10.0-x64.tar.gz"},
+		{"linux after the ROCm 10 rename", Linux, "b10800", "llama-b10800-bin-ubuntu-rocm-10.0-x64.tar.gz"},
+		{"windows before the rename", Windows, "b10355", "llama-b10355-bin-win-hip-radeon-x64.zip"},
+		{"windows at the rename", Windows, "b10356", "llama-b10356-bin-win-rocm-7.14-x64.zip"},
+		{"windows after the rename", Windows, "b10705", "llama-b10705-bin-win-rocm-7.14-x64.zip"},
+		{"windows before the ROCm 10 rename", Windows, "b10766", "llama-b10766-bin-win-rocm-7.14-x64.zip"},
+		{"windows at the ROCm 10 rename", Windows, "b10767", "llama-b10767-bin-win-rocm-10.0-x64.zip"},
+		{"windows after the ROCm 10 rename", Windows, "b10800", "llama-b10800-bin-win-rocm-10.0-x64.zip"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: AMD64, OS: tt.os, Processor: ROCm, Version: tt.version,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			want := "https://github.com/ggml-org/llama.cpp/releases/download/" + tt.version + "/" + tt.want
+			if len(urls) != 1 || urls[0] != want {
+				t.Fatalf("Resolve() = %v, want [%s]", urls, want)
+			}
+		})
+	}
+}
+
+// A tagged release keeps its binaries under a nightly build tag. That tag decides
+// the ROCm asset names.
+func TestDefaultResolverROCmTaggedRelease(t *testing.T) {
+	tests := []struct {
+		name     string
+		os       OS
+		upstream string
+		want     string
+	}{
+		{"linux before the rename", Linux, "b10355", "llama-b10355-bin-ubuntu-rocm-7.2-x64.tar.gz"},
+		{"linux between the renames", Linux, "b10766", "llama-b10766-bin-ubuntu-rocm-7.14-x64.tar.gz"},
+		{"linux at the ROCm 10 rename", Linux, "b10767", "llama-b10767-bin-ubuntu-rocm-10.0-x64.tar.gz"},
+		{"windows at the ROCm 10 rename", Windows, "b10767", "llama-b10767-bin-win-rocm-10.0-x64.zip"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: AMD64, OS: tt.os, Processor: ROCm, Version: "v0.3.0", UpstreamVersion: tt.upstream,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			want := "https://github.com/ggml-org/llama.cpp/releases/download/" + tt.upstream + "/" + tt.want
+			if len(urls) != 1 || urls[0] != want {
+				t.Fatalf("Resolve() = %v, want [%s]", urls, want)
+			}
+		})
+	}
+}
+
+// llama.cpp changed the OpenVINO version in its asset names at builds b11024 and b11374.
+func TestDefaultResolverOpenVINONaming(t *testing.T) {
+	tests := []struct {
+		name    string
+		os      OS
+		version string
+		want    string
+	}{
+		{"linux before 2026.4", Linux, "b11022", "llama-b11022-bin-ubuntu-openvino-2026.3.1-x64.tar.gz"},
+		{"linux at 2026.4", Linux, "b11024", "llama-b11024-bin-ubuntu-openvino-2026.4-x64.tar.gz"},
+		{"linux after 2026.4", Linux, "b11029", "llama-b11029-bin-ubuntu-openvino-2026.4-x64.tar.gz"},
+		{"windows before 2026.4", Windows, "b11022", "llama-b11022-bin-win-openvino-2026.3.1-x64.zip"},
+		{"windows at 2026.4", Windows, "b11024", "llama-b11024-bin-win-openvino-2026.4-x64.zip"},
+		{"windows after 2026.4", Windows, "b11029", "llama-b11029-bin-win-openvino-2026.4-x64.zip"},
+		{"linux before 2026.4.1", Linux, "b11372", "llama-b11372-bin-ubuntu-openvino-2026.4-x64.tar.gz"},
+		{"linux at 2026.4.1", Linux, "b11374", "llama-b11374-bin-ubuntu-openvino-2026.4.1-x64.tar.gz"},
+		{"linux after 2026.4.1", Linux, "b11429", "llama-b11429-bin-ubuntu-openvino-2026.4.1-x64.tar.gz"},
+		{"windows before 2026.4.1", Windows, "b11372", "llama-b11372-bin-win-openvino-2026.4-x64.zip"},
+		{"windows at 2026.4.1", Windows, "b11374", "llama-b11374-bin-win-openvino-2026.4.1-x64.zip"},
+		{"windows after 2026.4.1", Windows, "b11429", "llama-b11429-bin-win-openvino-2026.4.1-x64.zip"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: AMD64, OS: tt.os, Processor: OpenVINO, Version: tt.version,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			want := "https://github.com/ggml-org/llama.cpp/releases/download/" + tt.version + "/" + tt.want
+			if len(urls) != 1 || urls[0] != want {
+				t.Fatalf("Resolve() = %v, want [%s]", urls, want)
+			}
+		})
+	}
+}
+
+// A tagged release keeps its binaries under a nightly build tag, so that tag decides
+// the OpenVINO asset names.
+func TestDefaultResolverOpenVINOTaggedRelease(t *testing.T) {
+	tests := []struct {
+		name     string
+		os       OS
+		upstream string
+		want     string
+	}{
+		{"linux before 2026.4", Linux, "b11022", "llama-b11022-bin-ubuntu-openvino-2026.3.1-x64.tar.gz"},
+		{"linux at 2026.4", Linux, "b11024", "llama-b11024-bin-ubuntu-openvino-2026.4-x64.tar.gz"},
+		{"windows at 2026.4", Windows, "b11024", "llama-b11024-bin-win-openvino-2026.4-x64.zip"},
+		{"linux before 2026.4.1", Linux, "b11372", "llama-b11372-bin-ubuntu-openvino-2026.4-x64.tar.gz"},
+		{"linux at 2026.4.1", Linux, "b11429", "llama-b11429-bin-ubuntu-openvino-2026.4.1-x64.tar.gz"},
+		{"windows at 2026.4.1", Windows, "b11429", "llama-b11429-bin-win-openvino-2026.4.1-x64.zip"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: AMD64, OS: tt.os, Processor: OpenVINO, Version: "v0.3.0", UpstreamVersion: tt.upstream,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			want := "https://github.com/ggml-org/llama.cpp/releases/download/" + tt.upstream + "/" + tt.want
+			if len(urls) != 1 || urls[0] != want {
+				t.Fatalf("Resolve() = %v, want [%s]", urls, want)
+			}
+		})
+	}
+}
+
+// Only Linux and Windows on amd64 have OpenVINO builds.
+func TestDefaultResolverOpenVINOUnsupported(t *testing.T) {
+	tests := []struct {
+		name string
+		arch Arch
+		os   OS
+		want error
+	}{
+		{"linux arm64", ARM64, Linux, nil},
+		{"windows arm64", ARM64, Windows, nil},
+		{"bookworm", AMD64, Bookworm, ErrUnknownProcessor},
+		{"trixie", AMD64, Trixie, ErrUnknownProcessor},
+		{"darwin", ARM64, Darwin, ErrUnknownProcessor},
+		{"wasm", AMD64, Wasm, ErrUnknownProcessor},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DefaultResolver.Resolve(Target{
+				Arch: tt.arch, OS: tt.os, Processor: OpenVINO, Version: "b11024",
+			})
+			if err == nil {
+				t.Fatal("Resolve() accepted a target with no OpenVINO build")
+			}
+			if tt.want != nil && !errors.Is(err, tt.want) {
+				t.Errorf("Resolve() error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+// llama.cpp changed the CUDA version of its Windows builds at build b10977. Both
+// the runtime archive and the llama.cpp build must follow the requested build.
+func TestDefaultResolverWindowsCUDANaming(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		cuda    string
+	}{
+		{"before the change", "b10976", "13.3"},
+		{"at the change", "b10977", "13.4"},
+		{"after the change", "b11005", "13.4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: AMD64, OS: Windows, Processor: CUDA, Version: tt.version,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			location := "https://github.com/ggml-org/llama.cpp/releases/download/" + tt.version + "/"
+			want := []string{
+				location + "cudart-llama-bin-win-cuda-" + tt.cuda + "-x64.zip",
+				location + "llama-" + tt.version + "-bin-win-cuda-" + tt.cuda + "-x64.zip",
+			}
+			if len(urls) != 2 || urls[0] != want[0] || urls[1] != want[1] {
+				t.Fatalf("Resolve() = %v, want %v", urls, want)
+			}
+		})
+	}
+}
+
+// A tagged release keeps its binaries under a nightly build tag. That tag decides
+// the CUDA version in the Windows asset names.
+func TestDefaultResolverWindowsCUDATaggedRelease(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream string
+		cuda     string
+	}{
+		{"before the change", "b10976", "13.3"},
+		{"at the change", "b10977", "13.4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: AMD64, OS: Windows, Processor: CUDA, Version: "v0.3.0", UpstreamVersion: tt.upstream,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			location := "https://github.com/ggml-org/llama.cpp/releases/download/" + tt.upstream + "/"
+			want := []string{
+				location + "cudart-llama-bin-win-cuda-" + tt.cuda + "-x64.zip",
+				location + "llama-" + tt.upstream + "-bin-win-cuda-" + tt.cuda + "-x64.zip",
+			}
+			if len(urls) != 2 || urls[0] != want[0] || urls[1] != want[1] {
+				t.Fatalf("Resolve() = %v, want %v", urls, want)
+			}
+		})
+	}
+}
+
+// The machine's CUDA version selects the Linux CUDA build. A machine that reports
+// none gets the arch default.
+func TestDefaultResolverLinuxCUDAVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		arch        Arch
+		processor   Processor
+		cudaVersion string
+		want        string
+	}{
+		{"arm64 with no version", ARM64, CUDA, "", "llama-b11053-bin-ubuntu-cuda-arm64.tar.gz"},
+		{"arm64 with CUDA 12", ARM64, CUDA, "12.6", "llama-b11053-bin-ubuntu-cuda-arm64.tar.gz"},
+		{"arm64 with CUDA 13", ARM64, CUDA, "13.0", "llama-b11053-bin-ubuntu-cuda-13-arm64.tar.gz"},
+		{"amd64 with no version", AMD64, CUDA, "", "llama-b11053-bin-ubuntu-cuda-13-x64.tar.gz"},
+		{"amd64 with CUDA 12", AMD64, CUDA, "12.8", "llama-b11053-bin-ubuntu-cuda-x64.tar.gz"},
+		{"amd64 with CUDA 13", AMD64, CUDA, "13.1", "llama-b11053-bin-ubuntu-cuda-13-x64.tar.gz"},
+		{"arm64 asks for CUDA 13", ARM64, CUDA13, "12.6", "llama-b11053-bin-ubuntu-cuda-13-arm64.tar.gz"},
+		{"arm64 asks for CUDA 12", ARM64, CUDA12, "13.0", "llama-b11053-bin-ubuntu-cuda-arm64.tar.gz"},
+		{"amd64 asks for CUDA 12", AMD64, CUDA12, "13.0", "llama-b11053-bin-ubuntu-cuda-x64.tar.gz"},
+		{"amd64 asks for CUDA 13", AMD64, CUDA13, "12.8", "llama-b11053-bin-ubuntu-cuda-13-x64.tar.gz"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls, err := DefaultResolver.Resolve(Target{
+				Arch: tt.arch, OS: Linux, Processor: tt.processor,
+				Version: "b11053", CUDAVersion: tt.cudaVersion,
+			})
+			if err != nil {
+				t.Fatalf("Resolve() failed: %v", err)
+			}
+			want := "https://github.com/hybridgroup/llama-cpp-builder/releases/download/b11053/" + tt.want
+			if len(urls) != 1 || urls[0] != want {
+				t.Fatalf("Resolve() = %v, want %v", urls, []string{want})
+			}
+		})
+	}
+}
+
+// Bookworm ARM64 also uses the machine's CUDA build.
+func TestDefaultResolverBookwormCUDAVersion(t *testing.T) {
+	urls, err := DefaultResolver.Resolve(Target{
+		Arch: ARM64, OS: Bookworm, Processor: CUDA, Version: "b11053", CUDAVersion: "13.0",
+	})
+	if err != nil {
+		t.Fatalf("Resolve() failed: %v", err)
+	}
+	want := "https://github.com/hybridgroup/llama-cpp-builder/releases/download/b11053/llama-b11053-bin-ubuntu-cuda-13-arm64.tar.gz"
+	if len(urls) != 1 || urls[0] != want {
+		t.Fatalf("Resolve() = %v, want %v", urls, []string{want})
+	}
+}
+
+// WithCUDAVersion sets the field for the callers that pass strings.
+func TestInstallWithCUDAVersion(t *testing.T) {
+	var got []string
+	originalGet := getFunc
+	getFunc = func(ctx context.Context, asset Asset, dest string, progress getter.ProgressTracker) error {
+		got = append(got, asset.URL)
+		return nil
+	}
+	defer func() { getFunc = originalGet }()
+
+	err := GetWithContext(context.Background(), "arm64", "linux", "cuda", "b11053", t.TempDir(), nil,
+		WithCUDAVersion("13.0"))
+	if err != nil {
+		t.Fatalf("GetWithContext() failed: %v", err)
+	}
+	want := "https://github.com/hybridgroup/llama-cpp-builder/releases/download/b11053/llama-b11053-bin-ubuntu-cuda-13-arm64.tar.gz"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("downloaded %v, want %v", got, []string{want})
+	}
+}

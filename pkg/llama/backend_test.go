@@ -1,0 +1,199 @@
+package llama
+
+import (
+	"os"
+	"testing"
+)
+
+func TestMaxDevices(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	maxDevices := MaxDevices()
+	if maxDevices == 0 {
+		t.Fatal("MaxDevices returned 0, which is invalid")
+	}
+	t.Logf("MaxDevices returned: %d", maxDevices)
+}
+
+func TestMaxParallelSequences(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	maxParallelSequences := MaxParallelSequences()
+	if maxParallelSequences == 0 {
+		t.Fatal("MaxParallelSequences returned 0, which is invalid")
+	}
+	t.Logf("MaxParallelSequences returned: %d", maxParallelSequences)
+}
+
+func TestMaxTensorBuftOverrides(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	max := MaxTensorBuftOverrides()
+	if max == 0 {
+		t.Fatal("MaxTensorBuftOverrides returned 0, which is invalid")
+	}
+	t.Logf("MaxTensorBuftOverrides returned: %d", max)
+}
+
+func TestSupportsMmap(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	supportsMmap := SupportsMmap()
+	t.Logf("SupportsMmap returned: %v", supportsMmap)
+}
+
+func TestSupportsMlock(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	supportsMlock := SupportsMlock()
+	t.Logf("SupportsMlock returned: %v", supportsMlock)
+}
+
+func TestSupportsGpuOffload(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	supportsGpuOffload := SupportsGpuOffload()
+	t.Logf("SupportsGpuOffload returned: %v", supportsGpuOffload)
+}
+
+func TestSupportsRpc(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	supportsRpc := SupportsRpc()
+	t.Logf("SupportsRpc returned: %v", supportsRpc)
+}
+
+func TestTimeUs(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	time := TimeUs()
+	if time <= 0 {
+		t.Fatal("TimeUs returned an invalid value:", time)
+	}
+	t.Logf("TimeUs returned: %d microseconds", time)
+}
+
+func TestFlashAttnTypeName(t *testing.T) {
+	testSetup(t)
+	var flashAttnType FlashAttentionType = FlashAttentionTypeAuto
+
+	name := FlashAttnTypeName(flashAttnType)
+	if name == "" {
+		t.Fatal("FlashAttnTypeName returned empty string")
+	}
+	t.Logf("FlashAttnTypeName returned: %s", name)
+}
+
+func TestLoadModeName(t *testing.T) {
+	testSetup(t)
+
+	tests := []struct {
+		mode LoadMode
+		want string
+	}{
+		{LoadModeNone, "none"},
+		{LoadModeMmap, "mmap"},
+		{LoadModeMlock, "mlock"},
+		{LoadModeMmapMlock, "mmap+mlock"},
+		{LoadModeDirectIO, "dio"},
+	}
+
+	for _, tc := range tests {
+		name := LoadModeName(tc.mode)
+		if name != tc.want {
+			t.Errorf("LoadModeName(%d) = %q, want %q", tc.mode, name, tc.want)
+		}
+	}
+}
+
+func TestLoadModeFromStr(t *testing.T) {
+	testSetup(t)
+
+	tests := []struct {
+		str  string
+		want LoadMode
+	}{
+		{"none", LoadModeNone},
+		{"mmap", LoadModeMmap},
+		{"mlock", LoadModeMlock},
+		{"mmap+mlock", LoadModeMmapMlock},
+		{"dio", LoadModeDirectIO},
+		{"auto", LoadModeAuto},
+		{"bogus", LoadModeAuto},
+		{"MMAP", LoadModeAuto},
+		{"", LoadModeAuto},
+		{"mm\x00ap", LoadModeAuto},
+	}
+
+	for _, tc := range tests {
+		mode := LoadModeFromStr(tc.str)
+		if mode != tc.want {
+			t.Errorf("LoadModeFromStr(%q) = %d, want %d", tc.str, mode, tc.want)
+		}
+	}
+}
+
+func TestFtypeName(t *testing.T) {
+	testSetup(t)
+	var ftype Ftype = FtypeMostlyQ1_0
+
+	name := FtypeName(ftype)
+	if name == "" {
+		t.Fatal("FtypeName returned empty string")
+	}
+	t.Logf("FtypeName returned: %s", name)
+}
+
+func TestNumaInit(t *testing.T) {
+	testSetup(t)
+	var strategy NumaStrategy = NumaStrategyDisabled
+
+	// Should not panic or error
+	NumaInit(strategy)
+	t.Logf("NumaInit called with strategy: %d", strategy)
+}
+
+func TestPrintSystemInfo(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	info := PrintSystemInfo()
+	if info == "" {
+		t.Fatal("PrintSystemInfo returned empty string")
+	}
+	t.Logf("PrintSystemInfo returned:\n%s", info)
+}
+
+func TestVersion(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	v := Version()
+	if v == "" {
+		t.Fatal("Version returned empty string")
+	}
+	t.Logf("Version returned: %s", v)
+}
+
+func TestLoadEmptyPathUsesEnv(t *testing.T) {
+	testSetup(t)
+	defer testCleanup(t)
+
+	if err := Load(""); err != nil {
+		t.Fatalf("Load(\"\") failed: %v", err)
+	}
+	if got, want := LibPath(), os.Getenv("YZMA_LIB"); got != want {
+		t.Fatalf("LibPath() = %q, want %q", got, want)
+	}
+	if err := Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+}

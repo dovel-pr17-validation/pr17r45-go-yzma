@@ -1,0 +1,179 @@
+package mtmd
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
+	"testing"
+
+	"github.com/hybridgroup/yzma/pkg/llama"
+)
+
+var (
+	benchModel    llama.Model
+	benchCtx      llama.Context
+	benchMtmdCtx  Context
+	benchTemplate string
+	benchBitmap   Bitmap
+	benchImgData  []byte
+	benchReady    bool
+)
+
+var (
+	nCtx       int
+	nThreads   int
+	device     string
+	threadpool bool
+
+	benchThreadpool llama.Threadpool
+)
+
+func init() {
+	flag.IntVar(&nCtx, "nctx", 8192, "number of context tokens for llama.Context")
+	flag.IntVar(&nThreads, "threads", 0, "number of CPU threads, 0 for the value of llama.Threads")
+	flag.StringVar(&device, "device", "", "comma-separated list of devices to use for benchmarking (e.g. 'CUDA0')")
+	flag.BoolVar(&threadpool, "threadpool", false, "hold the CPU threads to the performance cores")
+}
+
+func TestMain(m *testing.M) {
+	flag.Parse() // Parse flags before running tests
+
+	// Suppress SIGPIPE for the whole process. Without this, when VideoInitFromBuf
+	// pipes a video buffer into ffprobe, the C++ feeder thread receives SIGPIPE
+	// (because ffprobe exits after probing) and kills the test process.
+	// With SIG_IGN the feeder thread gets EPIPE instead, which the library handles.
+	signal.Ignore(syscall.SIGPIPE)
+
+	code := m.Run()
+
+	if benchReady {
+		benchmarkTeardown()
+	}
+
+	os.Exit(code)
+}
+
+func benchmarkSetupOnce(b *testing.B) {
+	if benchReady {
+		return
+	}
+
+	modelFile := benchmarkModelFileName(b)
+	projectFile := benchmarkProjectorFileName(b)
+
+	benchmarkSetup(b)
+
+	mparams := llama.ModelDefaultParams()
+	mparams.LoadMode = llama.LoadModeNone
+
+	if strings.EqualFold(device, "CPU") {
+		mparams.SetCPUOnly()
+	} else if device != "" {
+		devs := []llama.GGMLBackendDevice{}
+		devices := strings.SplitSeq(device, ",")
+		for d := range devices {
+			dev := llama.GGMLBackendDeviceByName(d)
+			if dev == 0 {
+				b.Fatalf("unknown device: %s", d)
+			}
+			devs = append(devs, dev)
+		}
+
+		devs = append(devs, 0) // NULL terminator required by llama.cpp
+		if err := mparams.SetDevices(devs); err != nil {
+			b.Fatalf("SetDevices failed: %v", err)
+		}
+		defer runtime.KeepAlive(devs)
+	}
+
+	model, err := llama.ModelLoadFromFile(modelFile, mparams)
+	if err != nil {
+		b.Fatalf("ModelLoadFromFile failed: %v", err)
+	}
+	benchModel = model
+
+	params := llama.ContextDefaultParams()
+	params.NCtx = uint32(nCtx)
+	params.NBatch = 1024
+	if nThreads > 0 {
+		params.NThreads = int32(nThreads)
+		params.NThreadsBatch = int32(nThreads)
+	}
+
+	ctx, err := llama.InitFromModel(model, params)
+	if err != nil {
+		b.Fatalf("InitFromModel failed: %v", err)
+	}
+	benchCtx = ctx
+
+	if threadpool {
+		tp, err := newBenchThreadpool(params.NThreads)
+		if err != nil {
+			b.Fatalf("newBenchThreadpool failed: %v", err)
+		}
+		llama.AttachThreadpool(ctx, uintptr(tp), uintptr(tp))
+		benchThreadpool = tp
+	}
+
+	// The projector decides the image token count. Setting a minimum here
+	// breaks projectors with a fixed count.
+	mprms := ContextParamsDefault()
+	if nThreads > 0 {
+		mprms.Threads = int32(nThreads)
+	}
+
+	mtmdCtx, err := InitFromFile(projectFile, model, mprms)
+	if err != nil {
+		fmt.Println("unable to initialize context from file", err.Error())
+		os.Exit(1)
+	}
+	benchMtmdCtx = mtmdCtx
+
+	benchTemplate = llama.ModelChatTemplate(model, "")
+
+	data, x, y, err := openImageFile("../../images/domestic_llama.jpg")
+	if err != nil {
+		b.Fatal("could not open file")
+	}
+	benchImgData = data
+	benchBitmap = BitmapInit(x, y, benchImgData)
+
+	benchReady = true
+}
+
+// newBenchThreadpool pins n threads to the first n performance CPUs, so the
+// pool matches the context thread count.
+func newBenchThreadpool(n int32) (llama.Threadpool, error) {
+	cpus := llama.PerformanceCPUs()
+	if len(cpus) == 0 {
+		return 0, llama.ErrNoPerformanceCPUs
+	}
+	if int(n) < len(cpus) {
+		cpus = cpus[:n]
+	}
+
+	params := llama.ThreadpoolParamsDefault(int32(len(cpus)))
+	params.SetCPUs(cpus)
+	return llama.ThreadpoolNew(&params)
+}
+
+func benchmarkTeardown() {
+	BitmapFree(benchBitmap)
+	Free(benchMtmdCtx)
+	if benchThreadpool != 0 {
+		llama.DetachThreadpool(benchCtx)
+	}
+	llama.Free(benchCtx)
+	if benchThreadpool != 0 {
+		llama.ThreadpoolFree(benchThreadpool)
+	}
+	llama.ModelFree(benchModel)
+
+	llama.LogSet(llama.LogNormal)
+	LogSet(llama.LogNormal)
+	llama.Close()
+}

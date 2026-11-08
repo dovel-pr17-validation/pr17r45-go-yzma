@@ -1,0 +1,260 @@
+// yzma-bench writes the result of a benchmark run into the platform's markdown
+// file. See benchmarks/README.md.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"time"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+
+	var err error
+	switch os.Args[1] {
+	case "update":
+		err = runUpdate(os.Args[2:])
+	case "remove":
+		err = runRemove(os.Args[2:])
+	case "check":
+		err = runCheck(os.Args[2:])
+	case "-h", "--help", "help":
+		usage()
+		return
+	default:
+		usage()
+		os.Exit(2)
+	}
+
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "yzma-bench:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `usage:
+  yzma-bench update --file FILE --suite SUITE --backend BACKEND --machine NAME [flags]
+  yzma-bench remove --file FILE KEY...
+  yzma-bench check FILE...
+
+update puts one result in the file of the platform and makes the tables again.
+remove deletes the sections of the given keys and makes the tables again.
+check verifies that the tables agree with the sections.
+`)
+}
+
+func runUpdate(args []string) error {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	file := fs.String("file", "", "markdown file for the platform")
+	suite := fs.String("suite", "", "benchmark suite (text, multimodal, compare)")
+	backend := fs.String("backend", "", "backend (cpu, cuda, rocm, vulkan, metal, webgpu) or engine (yzma, ollama, dmr)")
+	arch := fs.String("arch", "", "architecture, empty to take goarch from the output")
+	machine := fs.String("machine", "", "short name of the machine, used in the key")
+	device := fs.String("device", "", "device for the run, in go test format (CUDA0, VULKAN1)")
+	model := fs.String("model", "", "short name of the model, needed by the comparison suite")
+	label := fs.String("label", "", "display name of the machine, empty to use the short name")
+	llamacpp := fs.String("llamacpp", "", "llama.cpp build tag")
+	engineVersion := fs.String("engine-version", "", "engine release, for the comparison suite")
+	yzma := fs.String("yzma", "", "yzma version")
+	date := fs.String("date", "", "date of the run, default today")
+	output := fs.String("output", "-", "file with the go test output, - for stdin")
+	deviceInfo := fs.String("device-info", "", "file with the device information")
+	notes := fs.String("notes", "", "one line of text to show above the output")
+	dryRun := fs.Bool("dry-run", false, "print the result and change no file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	switch {
+	case *file == "":
+		return fmt.Errorf("--file is needed")
+	case *suite == "":
+		return fmt.Errorf("--suite is needed")
+	case *backend == "":
+		return fmt.Errorf("--backend is needed")
+	case *machine == "":
+		return fmt.Errorf("--machine is needed")
+	}
+
+	// Default the date to today.
+	if !isSet(fs, "date") {
+		*date = time.Now().Format("2006-01-02")
+	}
+
+	raw, err := readInput(*output)
+	if err != nil {
+		return err
+	}
+
+	result, err := parseBenchmark(raw)
+	if err != nil {
+		return err
+	}
+
+	deviceText := ""
+	if *deviceInfo != "" {
+		b, err := os.ReadFile(*deviceInfo)
+		if err != nil {
+			return err
+		}
+		deviceText = string(b)
+	}
+
+	m := meta{
+		Suite:           *suite,
+		Backend:         *backend,
+		Arch:            firstOf(*arch, result.arch),
+		Machine:         *machine,
+		Device:          *device,
+		Model:           *model,
+		Label:           firstOf(*label, *machine),
+		CPU:             result.cpu,
+		TokensPerSecond: result.tokensPerSecond,
+		TTFTMs:          result.ttftMs,
+		TotalMs:         result.totalMs,
+		PromptTokens:    result.promptTokens,
+		LlamaCPP:        firstOf(*llamacpp, result.llamaCPP),
+		EngineVersion:   *engineVersion,
+		Yzma:            *yzma,
+		Date:            *date,
+	}
+	if err := m.validate(); err != nil {
+		return err
+	}
+
+	doc, err := loadDocument(*file)
+	if err != nil {
+		return err
+	}
+
+	body := renderSection(m, *notes, deviceText, raw)
+	if err := doc.put(m, body); err != nil {
+		return err
+	}
+	if err := doc.buildTables(); err != nil {
+		return err
+	}
+
+	if *dryRun {
+		fmt.Print(doc.String())
+		return nil
+	}
+
+	return doc.save()
+}
+
+// runRemove deletes one or more sections. Use it when a result is no longer
+// comparable with the others, for example after a model change.
+func runRemove(args []string) error {
+	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+	file := fs.String("file", "", "markdown file for the platform")
+	dryRun := fs.Bool("dry-run", false, "print the result and change no file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *file == "" {
+		return fmt.Errorf("--file is needed")
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("pass one or more keys, as shown in the file markers")
+	}
+
+	doc, err := loadDocument(*file)
+	if err != nil {
+		return err
+	}
+
+	for _, key := range fs.Args() {
+		if !doc.remove(key) {
+			return fmt.Errorf("%s has no section with the key %q", *file, key)
+		}
+	}
+	if err := doc.buildTables(); err != nil {
+		return err
+	}
+
+	if *dryRun {
+		fmt.Print(doc.String())
+		return nil
+	}
+
+	return doc.save()
+}
+
+func runCheck(args []string) error {
+	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("pass one or more files")
+	}
+
+	bad := 0
+	for _, name := range fs.Args() {
+		doc, err := loadDocument(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
+			bad++
+			continue
+		}
+
+		before := doc.String()
+		if err := doc.buildTables(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
+			bad++
+			continue
+		}
+		if doc.String() != before {
+			fmt.Fprintf(os.Stderr, "%s: the tables do not agree with the sections\n", name)
+			bad++
+			continue
+		}
+		fmt.Printf("%s: ok, %d sections\n", name, len(doc.sections()))
+	}
+
+	if bad > 0 {
+		return fmt.Errorf("%d file(s) need an update, run yzma-bench update or make the tables again", bad)
+	}
+
+	return nil
+}
+
+func isSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+
+	return found
+}
+
+func readInput(name string) (string, error) {
+	if name == "-" {
+		b, err := io.ReadAll(os.Stdin)
+		return string(b), err
+	}
+
+	b, err := os.ReadFile(name)
+	return string(b), err
+}
+
+func firstOf(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+
+	return ""
+}

@@ -1,0 +1,202 @@
+package cmd
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+
+	"github.com/hybridgroup/yzma/pkg/download"
+	"github.com/urfave/cli/v2"
+)
+
+var InstallCmd = &cli.Command{
+	Name:  "install",
+	Usage: "Install llama.cpp libraries used by yzma",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:    "version",
+			Aliases: []string{"v"},
+			Usage:   "version of llama.cpp to install, optionally as VERSION@sha256:DIGEST to pin the digests (leave empty for the version this yzma release uses)",
+			Value:   "",
+		},
+		&cli.StringFlag{
+			Name:    "lib",
+			Aliases: []string{"l"},
+			Usage:   "path to llama.cpp compiled library files",
+			EnvVars: []string{"YZMA_LIB"},
+		},
+		&cli.StringFlag{
+			Name:    "processor",
+			Aliases: []string{"p"},
+			Usage:   "processor to use (cpu, cuda, cuda-12, cuda-13, metal, openvino, rocm, vulkan)",
+			Value:   "",
+		},
+		&cli.StringFlag{
+			Name:  "os",
+			Usage: "target to use (linux, windows, darwin, bookworm, trixie, wasm)",
+			Value: runtime.GOOS,
+		},
+		&cli.BoolFlag{
+			Name:    "upgrade",
+			Aliases: []string{"u"},
+			Usage:   "upgrade existing installation",
+			Value:   false,
+		},
+		&cli.BoolFlag{
+			Name:    "quiet",
+			Aliases: []string{"q"},
+			Usage:   "suppress output during installation",
+			Value:   false,
+		},
+		&cli.StringFlag{
+			Name:    "verify",
+			Usage:   "how to check the digest of each download (available, require, off)",
+			EnvVars: []string{"YZMA_VERIFY"},
+			Value:   "available",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		return runInstall(c)
+	},
+}
+
+func runInstall(c *cli.Context) error {
+	libPath := c.String("lib")
+	version := c.String("version")
+	processor := c.String("processor")
+	osInstall := c.String("os")
+	upgrade := c.Bool("upgrade")
+
+	if libPath == "" {
+		return fmt.Errorf("missing lib flag or YZMA_LIB env var")
+	}
+
+	// A wasm install uses the WebAssembly build of llama.cpp, which has its own
+	// file name, so the existing install check uses the target, not the host.
+	if !upgrade {
+		if _, err := os.Stat(filepath.Join(libPath, download.LibraryName(osInstall))); !os.IsNotExist(err) {
+			fmt.Println("llama.cpp already installed at", libPath)
+			return nil
+		}
+	}
+
+	// Strip the digest here too, so bad input fails before any download and the
+	// message names the tag rather than the pin.
+	tag, manifestDigest, err := download.ParsePinnedVersion(version)
+	if err != nil {
+		return err
+	}
+
+	// An empty version installs the release pinned by this yzma release, which has
+	// its own digest, so the messages report that pin instead of nothing.
+	if tag == "" && download.DefaultVersion != "" {
+		tag, manifestDigest, err = download.ParsePinnedVersion(download.DefaultVersion)
+		if err != nil {
+			return err
+		}
+	}
+
+	quiet := c.Bool("quiet")
+	if !quiet {
+		switch {
+		case tag == "" || tag == "latest":
+			fmt.Println("installing latest llama.cpp version to", libPath)
+		default:
+			fmt.Println("installing llama.cpp version", tag, "to", libPath)
+		}
+		if manifestDigest != "" {
+			fmt.Println("digests pinned to sha256:" + manifestDigest)
+		}
+	} else {
+		download.ProgressTracker = nil
+	}
+
+	if osInstall == download.Wasm.String() {
+		// A WebAssembly build has no GPU.
+		processor = download.CPU.String()
+	}
+
+	// The CUDA version selects the CUDA build, so read it both for a requested
+	// CUDA install and for one detected here.
+	var cudaVersion string
+	if processor == "" || processor == download.CUDA.String() {
+		cudaInstalled, detected := download.HasCUDA()
+		switch {
+		case cudaInstalled:
+			cudaVersion = detected
+			if processor == "" {
+				processor = download.CUDA.String()
+				if !quiet {
+					fmt.Printf("CUDA detected (version %s), using CUDA build\n", cudaVersion)
+				}
+			}
+		case processor == "":
+			processor = download.CPU.String()
+			if rocmInstalled, rocmVersion := download.HasROCm(); rocmInstalled {
+				if !quiet {
+					fmt.Printf("ROCm detected (version %s), using ROCm build\n", rocmVersion)
+				}
+				processor = download.ROCm.String()
+			}
+		}
+	}
+
+	verify, err := download.ParseVerifyPolicy(c.String("verify"))
+	if err != nil {
+		return err
+	}
+
+	if err := download.Get(runtime.GOARCH, osInstall, processor, version, libPath,
+		download.WithVerify(verify), download.WithCUDAVersion(cudaVersion)); err != nil {
+		return fmt.Errorf("failed to download llama.cpp: %w", err)
+	}
+
+	if !quiet {
+		fmt.Println("done.")
+		if osInstall == download.Wasm.String() {
+			showWasmRequirements(libPath)
+		} else {
+			showInstallRequirements(libPath)
+		}
+	}
+
+	return nil
+}
+
+// showWasmRequirements explains how to use a WebAssembly install. YZMA_LIB does
+// not apply, because a browser loads the files over HTTP.
+func showWasmRequirements(libPath string) {
+	fmt.Println(`
+The WebAssembly build of llama.cpp is in ` + libPath + `
+
+Put the JavaScript glue and the program of your page in the same directory, then
+serve it with the headers that a build with more than one thread needs:
+
+    make wasm-example
+    make serve-wasm`)
+}
+
+func showInstallRequirements(libPath string) {
+	if os.Getenv("YZMA_LIB") == libPath {
+		return
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		fmt.Println(`
+You may want to set the YZMA_LIB environment variable to the directory with your llama.cpp library files. For example:
+
+    export YZMA_LIB=` + libPath)
+	case "windows":
+		fmt.Println(`
+You may want to set the YZMA_LIB environment variable to the directory with your llama.cpp library files. For example:
+
+    set YZMA_LIB=` + libPath)
+	case "darwin":
+		fmt.Println(`
+You may want to set the YZMA_LIB environment variable to the directory with your llama.cpp library files. For example:
+
+    export YZMA_LIB=` + libPath)
+	}
+}

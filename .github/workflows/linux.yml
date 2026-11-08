@@ -1,0 +1,91 @@
+name: Linux
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Get latest llama.cpp version
+        id: llama-version
+        run: |
+          VERSION=$(curl -s https://hybridgroup.github.io/llama-cpp-builder/version.json | jq -r '.tag_name')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest llama.cpp version: $VERSION"
+      - name: Install yzma command
+        run: go install .
+      - name: Install llama.cpp binaries
+        run: |
+          set -e
+          yzma install -lib $GITHUB_WORKSPACE/lib -version ${{ steps.llama-version.outputs.version }}
+      - name: Add llama.cpp libs to path
+        run: |
+            echo "YZMA_LIB=$GITHUB_WORKSPACE/lib" >> "$GITHUB_ENV"
+      - name: Build examples
+        run: |
+          set -e
+          for dir in ./examples/*/; do
+            if [ -f "$dir/main.go" ]; then
+              echo "Building $dir..."
+              go build -o /dev/null "$dir"
+            fi
+          done
+      - name: Cache test models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: ${{ runner.os }}-models-v6
+      - name: Download test models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+            mkdir -p ./models
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q2_K.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/models-moved/resolve/main/jina-reranker-v1-tiny-en/ggml-model-f16.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/callgg/t5-base-encoder-f32/resolve/main/t5base-encoder-q4_0.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/deadprogram/yzma-tests/resolve/main/Gemma2-Base-F32.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/deadprogram/yzma-tests/resolve/main/Gemma2-Lora-F32-LoRA.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/split/stories15M-q8_0-00001-of-00003.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/split/stories15M-q8_0-00002-of-00003.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/split/stories15M-q8_0-00003-of-00003.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/Julia-1-GGUF/resolve/main/Julia-1-Q8_0.gguf
+            yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/Laya-GGUF/resolve/main/Laya-Q8_0.gguf
+      - name: Get test video
+        run: |
+            curl https://upload.wikimedia.org/wikipedia/commons/a/a1/Llama_in_ueno_zoo_-_2009_Aug.webm -o llama.webm
+      - name: Run unit tests
+        run: |
+          export YZMA_TEST_MODEL=$GITHUB_WORKSPACE/models/SmolLM-135M.Q2_K.gguf
+          export YZMA_TEST_MMMODEL=$GITHUB_WORKSPACE/models/SmolVLM-256M-Instruct-Q8_0.gguf
+          export YZMA_TEST_MMPROJ=$GITHUB_WORKSPACE/models/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
+          export YZMA_TEST_QUANTIZE_MODEL=$GITHUB_WORKSPACE/models/ggml-model-f16.gguf
+          export YZMA_TEST_ENCODER_MODEL=$GITHUB_WORKSPACE/models/t5base-encoder-q4_0.gguf
+          export YZMA_TEST_LORA_MODEL=$GITHUB_WORKSPACE/models/Gemma2-Base-F32.gguf
+          export YZMA_TEST_LORA_ADAPTER=$GITHUB_WORKSPACE/models/Gemma2-Lora-F32-LoRA.gguf
+          export YZMA_TEST_SPLIT_MODELS="$GITHUB_WORKSPACE/models/stories15M-q8_0-00001-of-00003.gguf,$GITHUB_WORKSPACE/models/stories15M-q8_0-00002-of-00003.gguf,$GITHUB_WORKSPACE/models/stories15M-q8_0-00003-of-00003.gguf"
+          export YZMA_TEST_VIDEO=$GITHUB_WORKSPACE/llama.webm
+          export YZMA_TEST_JULIA_MODEL=$GITHUB_WORKSPACE/models/Julia-1-Q8_0.gguf
+          export YZMA_TEST_LAYA_MODEL=$GITHUB_WORKSPACE/models/Laya-Q8_0.gguf
+          go test -v ./...
+      - name: Run inference test
+        run: go run ./examples/hello
+      - name: Run embedding test
+        run: go run ./examples/embeddings -model $GITHUB_WORKSPACE/models/SmolLM-135M.Q2_K.gguf -p "Hello World"

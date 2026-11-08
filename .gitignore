@@ -1,0 +1,10 @@
+lib/
+*.so
+*.dylib
+*.dll
+/models
+yzma
+llama.webm
+
+# WebAssembly build output
+build/
